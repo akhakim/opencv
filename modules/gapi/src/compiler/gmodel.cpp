@@ -2,7 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 //
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 
 
 #include "precomp.hpp"
@@ -54,7 +54,22 @@ ade::NodeHandle GModel::mkDataNode(GModel::Graph &g, const GOrigin& origin)
     // associated host-type constructor (e.g. when the array is
     // somewhere in the middle of the graph).
     auto ctor_copy = origin.ctor;
-    g.metadata(data_h).set(Data{origin.shape, id, meta, ctor_copy, storage});
+    g.metadata(data_h).set(Data{origin.shape, id, meta, ctor_copy, origin.kind, storage});
+    return data_h;
+}
+
+ade::NodeHandle GModel::mkDataNode(GModel::Graph &g, const GShape shape)
+{
+    ade::NodeHandle data_h = g.createNode();
+    g.metadata(data_h).set(NodeType{NodeType::DATA});
+
+    const auto id = g.metadata().get<DataObjectCounter>().GetNewId(shape);
+    GMetaArg meta;
+    HostCtor ctor;
+    Data::Storage storage = Data::Storage::INTERNAL; // By default, all objects are marked INTERNAL
+    cv::detail::OpaqueKind kind = cv::detail::OpaqueKind::CV_UNKNOWN;
+
+    g.metadata(data_h).set(Data{shape, id, meta, ctor, kind, storage});
     return data_h;
 }
 
@@ -104,7 +119,7 @@ void GModel::linkOut(Graph &g, ade::NodeHandle opH, ade::NodeHandle objH, std::s
     op.outs[out_port] = RcDesc{gm.rc, gm.shape, {}};
 }
 
-std::vector<ade::NodeHandle> GModel::orderedInputs(ConstGraph &g, ade::NodeHandle nh)
+std::vector<ade::NodeHandle> GModel::orderedInputs(const ConstGraph &g, ade::NodeHandle nh)
 {
     std::vector<ade::NodeHandle> sorted_in_nhs(nh->inEdges().size());
     for (const auto& in_eh : nh->inEdges())
@@ -116,7 +131,7 @@ std::vector<ade::NodeHandle> GModel::orderedInputs(ConstGraph &g, ade::NodeHandl
     return sorted_in_nhs;
 }
 
-std::vector<ade::NodeHandle> GModel::orderedOutputs(ConstGraph &g, ade::NodeHandle nh)
+std::vector<ade::NodeHandle> GModel::orderedOutputs(const ConstGraph &g, ade::NodeHandle nh)
 {
     std::vector<ade::NodeHandle> sorted_out_nhs(nh->outEdges().size());
     for (const auto& out_eh : nh->outEdges())
@@ -213,7 +228,7 @@ void GModel::redirectWriter(Graph &g, ade::NodeHandle from, ade::NodeHandle to)
     linkOut(g, op, to, output.port);
 }
 
-GMetaArgs GModel::collectInputMeta(GModel::ConstGraph cg, ade::NodeHandle node)
+GMetaArgs GModel::collectInputMeta(const GModel::ConstGraph &cg, ade::NodeHandle node)
 {
     GAPI_Assert(cg.metadata(node).get<NodeType>().t == NodeType::OP);
     GMetaArgs in_meta_args(cg.metadata(node).get<Op>().args.size());
@@ -240,7 +255,7 @@ ade::EdgeHandle GModel::getInEdgeByPort(const GModel::ConstGraph& cg,
     return *edge;
 }
 
-GMetaArgs GModel::collectOutputMeta(GModel::ConstGraph cg, ade::NodeHandle node)
+GMetaArgs GModel::collectOutputMeta(const GModel::ConstGraph &cg, ade::NodeHandle node)
 {
     GAPI_Assert(cg.metadata(node).get<NodeType>().t == NodeType::OP);
     GMetaArgs out_meta_args(cg.metadata(node).get<Op>().outs.size());

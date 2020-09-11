@@ -36,9 +36,21 @@ namespace detail
     using last_type_t = typename last_type<Ts...>::type;
 }
 
+// Forward-declare the serialization objects
+namespace gimpl {
+namespace s11n {
+namespace I {
+    struct IStream;
+    struct OStream;
+} // namespace I
+} // namespace s11n
+} // namespace gimpl
+
 /**
  * \addtogroup gapi_main_classes
  * @{
+ *
+ * @brief G-API classes for constructed and compiled graphs.
  */
 /**
  * @brief GComputation class represents a captured computation
@@ -106,7 +118,7 @@ namespace detail
  *
  * @sa GCompiled
  */
-class GAPI_EXPORTS GComputation
+class GAPI_EXPORTS_W GComputation
 {
 public:
     class Priv;
@@ -179,7 +191,7 @@ public:
      * @param in2 second input GMat of the defined binary computation
      * @param out output GMat of the defined binary computation
      */
-    GComputation(GMat in1, GMat in2, GMat out);        // Binary overload
+    GAPI_WRAP GComputation(GMat in1, GMat in2, GMat out);        // Binary overload
 
     /**
      * @brief Defines a binary (two inputs -- one output) computation
@@ -248,8 +260,8 @@ public:
     void apply(GRunArgs &&ins, GRunArgsP &&outs, GCompileArgs &&args = {});       // Arg-to-arg overload
 
     /// @private -- Exclude this function from OpenCV documentation
-    void apply(const std::vector<cv::gapi::own::Mat>& ins,                        // Compatibility overload
-               const std::vector<cv::gapi::own::Mat>& outs,
+    void apply(const std::vector<cv::Mat>& ins,                                   // Compatibility overload
+               const std::vector<cv::Mat>& outs,
                GCompileArgs &&args = {});
 
     // 2. Syntax sugar and compatibility overloads
@@ -263,7 +275,7 @@ public:
      * @param args compilation arguments for underlying compilation
      * process.
      */
-    void apply(cv::Mat in, cv::Mat &out, GCompileArgs &&args = {});               // Unary overload
+    void apply(cv::Mat in, cv::Mat &out, GCompileArgs &&args = {}); // Unary overload
 
     /**
      * @brief Execute an unary computation (with compilation on the fly)
@@ -274,7 +286,7 @@ public:
      * @param args compilation arguments for underlying compilation
      * process.
      */
-    void apply(cv::Mat in, cv::Scalar &out, GCompileArgs &&args = {});            // Unary overload (scalar)
+    void apply(cv::Mat in, cv::Scalar &out, GCompileArgs &&args = {}); // Unary overload (scalar)
 
     /**
      * @brief Execute a binary computation (with compilation on the fly)
@@ -286,7 +298,7 @@ public:
      * @param args compilation arguments for underlying compilation
      * process.
      */
-    void apply(cv::Mat in1, cv::Mat in2, cv::Mat &out, GCompileArgs &&args = {}); // Binary overload
+    GAPI_WRAP void apply(cv::Mat in1, cv::Mat in2, CV_OUT cv::Mat &out, GCompileArgs &&args = {}); // Binary overload
 
     /**
      * @brief Execute an binary computation (with compilation on the fly)
@@ -312,7 +324,7 @@ public:
      * @param args compilation arguments for underlying compilation
      * process.
      *
-     * Numbers of elements in ins/outs vectos must match numbers of
+     * Numbers of elements in ins/outs vectors must match numbers of
      * inputs/outputs which were used to define this GComputation.
      */
     void apply(const std::vector<cv::Mat>& ins,         // Compatibility overload
@@ -371,7 +383,7 @@ public:
     //     template<typename... Ts>
     //     GCompiled compile(const Ts&... metas, GCompileArgs &&args)
     //
-    // But not all compilers can hande this (and seems they shouldn't be able to).
+    // But not all compilers can handle this (and seems they shouldn't be able to).
     // FIXME: SFINAE looks ugly in the generated documentation
     /**
      * @overload
@@ -410,11 +422,12 @@ public:
      *
      * @param in_metas vector of input metadata configuration. Grab
      * metadata from real data objects (like cv::Mat or cv::Scalar)
-     * using cv::descr_of(), or create it on your own.  @param args
-     * compilation arguments for this compilation process. Compilation
-     * arguments directly affect what kind of executable object would
-     * be produced, e.g. which kernels (and thus, devices) would be
-     * used to execute computation.
+     * using cv::descr_of(), or create it on your own.
+     *
+     * @param args compilation arguments for this compilation
+     * process. Compilation arguments directly affect what kind of
+     * executable object would be produced, e.g. which kernels (and
+     * thus, devices) would be used to execute computation.
      *
      * @return GStreamingCompiled, a streaming-oriented executable
      * computation compiled specifically for the given input
@@ -423,6 +436,27 @@ public:
      * @sa @ref gapi_compile_args
      */
     GStreamingCompiled compileStreaming(GMetaArgs &&in_metas, GCompileArgs &&args = {});
+
+    /**
+     * @brief Compile the computation for streaming mode.
+     *
+     * This method triggers compilation process and produces a new
+     * GStreamingCompiled object which then can process video stream
+     * data in any format. Underlying mechanisms will be adjusted to
+     * every new input video stream automatically, but please note that
+     * _not all_ existing backends support this (see reshape()).
+     *
+     * @param args compilation arguments for this compilation
+     * process. Compilation arguments directly affect what kind of
+     * executable object would be produced, e.g. which kernels (and
+     * thus, devices) would be used to execute computation.
+     *
+     * @return GStreamingCompiled, a streaming-oriented executable
+     * computation compiled for any input image format.
+     *
+     * @sa @ref gapi_compile_args
+     */
+    GStreamingCompiled compileStreaming(GCompileArgs &&args = {});
 
     // 2. Direct metadata version
     /**
@@ -471,6 +505,10 @@ public:
     Priv& priv();
     /// @private
     const Priv& priv() const;
+    /// @private
+    explicit GComputation(cv::gimpl::s11n::I::IStream &);
+    /// @private
+    void serialize(cv::gimpl::s11n::I::OStream &) const;
 
 protected:
 

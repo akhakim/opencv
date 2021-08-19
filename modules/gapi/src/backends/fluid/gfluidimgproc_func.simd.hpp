@@ -995,6 +995,28 @@ void run_rgb2yuv422_impl(uchar out[], const uchar in[], int width)
     }
 }
 
+#if CV_SIMD
+CV_ALWAYS_INLINE v_float32 v_load_f32(const ushort* in)
+{
+	return v_cvt_f32(v_reinterpret_as_s32(vx_load_expand(in)));
+}
+
+CV_ALWAYS_INLINE v_float32 v_load_f32(const short* in)
+{
+	return v_cvt_f32(vx_load_expand(in));
+}
+
+CV_ALWAYS_INLINE v_float32 v_load_f32(const uchar* in)
+{
+	return v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(in)));
+}
+
+CV_ALWAYS_INLINE v_float32 v_load_f32(const float* in)
+{
+	return vx_load(in);
+}
+#endif
+
 //-----------------------------
 //
 // Fluid kernels: sepFilter 3x3
@@ -1004,76 +1026,93 @@ void run_rgb2yuv422_impl(uchar out[], const uchar in[], int width)
 #if CV_SIMD
 // this variant not using buf[] appears 15% faster than reference any-2-float code below
 template<bool noscale, typename SRC>
-static void run_sepfilter3x3_any2float(float out[], const SRC *in[], int width, int chan,
+CV_ALWAYS_INLINE void run_sepfilter3x3_any2float(float out[], const SRC *in[], int width, int chan,
                                        const float kx[], const float ky[], int border,
                                        float scale, float delta)
 {
+	constexpr int nlanes = v_float32::nlanes;
     const int length = width * chan;
     const int shift = border * chan;
+
+	GAPI_DbgAssert(length >= nlanes);
 
     const float kx0 = kx[0], kx1 = kx[1], kx2 = kx[2];
     const float ky0 = ky[0], ky1 = ky[1], ky2 = ky[2];
 
-    for (int l=0; l < length; )
-    {
-        static const int nlanes = v_float32::nlanes;
+	v_float32 v_kx0 = vx_setall_f32(kx0);
+	v_float32 v_kx1 = vx_setall_f32(kx1);
+	v_float32 v_kx2 = vx_setall_f32(kx2);
 
+	v_float32 v_ky0 = vx_setall_f32(ky0);
+	v_float32 v_ky1 = vx_setall_f32(ky1);
+	v_float32 v_ky2 = vx_setall_f32(ky2);
+
+    for (int l = 0; length >= nlanes; )
+    {
         // main part
         for ( ; l <= length - nlanes; l += nlanes)
         {
-            auto xsum = [l, shift, kx0, kx1, kx2](const SRC i[])
+            auto xsum = [l, shift, v_kx0, v_kx1, v_kx2](const SRC i[])
             {
                 v_float32 t0 = vx_load_f32(&i[l - shift]);
                 v_float32 t1 = vx_load_f32(&i[l        ]);
                 v_float32 t2 = vx_load_f32(&i[l + shift]);
-                v_float32 t = t0 * vx_setall_f32(kx0);
-                    t = v_fma(t1,  vx_setall_f32(kx1), t);
-                    t = v_fma(t2,  vx_setall_f32(kx2), t);
+                v_float32 t = t0 * v_kx0;
+						  t = v_fma(t1, v_kx1, t);
+						  t = v_fma(t2, v_kx2, t);
                 return t;
             };
 
             v_float32 s0 = xsum(in[0]);
             v_float32 s1 = xsum(in[1]);
             v_float32 s2 = xsum(in[2]);
-            v_float32 s = s0 * vx_setall_f32(ky0);
-                s = v_fma(s1,  vx_setall_f32(ky1), s);
-                s = v_fma(s2,  vx_setall_f32(ky2), s);
+            v_float32 s = s0 * v_ky0;
+					  s = v_fma(s1, v_ky1, s);
+					  s = v_fma(s2, v_ky2, s);
 
             if (!noscale)
             {
                 s = v_fma(s, vx_setall_f32(scale), vx_setall_f32(delta));
             }
 
-            v_store(&out[l], s);
+            vx_store(&out[l], s);
         }
 
         // tail (if any)
         if (l < length)
-        {
-            GAPI_DbgAssert(length >= nlanes);
+        { 
             l = length - nlanes;
+			continue;
         }
+		break;
     }
 }
 
 // this variant with manually vectored rounding to short/ushort appears 10-40x faster
 // than reference code below
 template<bool noscale, typename DST, typename SRC>
-static void run_sepfilter3x3_any2short(DST out[], const SRC *in[], int width, int chan,
+CV_ALWAYS_INLINE void run_sepfilter3x3_any2short(DST out[], const SRC *in[], int width, int chan,
                                        const float kx[], const float ky[], int border,
                                        float scale, float delta,
                                        float *buf[], int y, int y0)
 {
+	constexpr int nlanes = v_int16::nlanes;
+	const int length = width * chan;
+	GAPI_DbgAssert(length >= nlanes);
+
     int r[3];
     r[0] = (y - y0    ) % 3;  // buf[r[0]]: previous
     r[1] = (y - y0 + 1) % 3;  //            this
     r[2] = (y - y0 + 2) % 3;  //            next row
 
-    const int length = width * chan;
     const int shift = border * chan;
 
     const float kx0 = kx[0], kx1 = kx[1], kx2 = kx[2];
     const float ky0 = ky[0], ky1 = ky[1], ky2 = ky[2];
+
+	v_float32 v_kx0 = vx_setall_f32(kx0);
+	v_float32 v_kx1 = vx_setall_f32(kx1);
+	v_float32 v_kx2 = vx_setall_f32(kx2);
 
     // horizontal pass
 
@@ -1084,31 +1123,59 @@ static void run_sepfilter3x3_any2short(DST out[], const SRC *in[], int width, in
         //                      previous , this , next pixel
         const SRC *s[3] = {in[k] - shift , in[k], in[k] + shift};
 
+#if 0
         // rely on compiler vectoring
-        for (int l=0; l < length; l++)
+        for (int l = 0; l < length; l++)
         {
             buf[r[k]][l] = s[0][l]*kx0 + s[1][l]*kx1 + s[2][l]*kx2;
         }
+
+#else
+		for (int l = 0; length >= nlanes/2;)
+		{
+			// main part of row
+			for (; l <= length - nlanes/2; l += nlanes/2)
+			{
+				v_float32 s0 = v_load_f32(&s[0][l]);
+				v_float32 s1 = v_load_f32(&s[1][l]);
+				v_float32 s2 = v_load_f32(&s[2][l]);
+
+				v_float32 res = s0 * v_kx0;
+						  res = v_fma(s1, v_kx1, res);
+						  res = v_fma(s2, v_kx2, res);
+				vx_store(&buf[r[k]][l], res);
+			}
+
+			// tail (if any)
+			if (l < length)
+			{
+				l = length - nlanes/2;
+				continue;
+			}
+			break;
+		}
+#endif
     }
 
     // vertical pass
-
     const int r0=r[0], r1=r[1], r2=r[2];
 
-    for (int l=0; l < length;)
-    {
-        constexpr int nlanes = v_int16::nlanes;
+	v_float32 v_ky0 = vx_setall_f32(ky0);
+	v_float32 v_ky1 = vx_setall_f32(ky1);
+	v_float32 v_ky2 = vx_setall_f32(ky2);
 
+    for (int l = 0; length >= nlanes;)
+    {
         // main part of row
         for (; l <= length - nlanes; l += nlanes)
         {
-            v_float32 sum0 = vx_load(&buf[r0][l])            * vx_setall_f32(ky0);
-                sum0 = v_fma(vx_load(&buf[r1][l]),             vx_setall_f32(ky1), sum0);
-                sum0 = v_fma(vx_load(&buf[r2][l]),             vx_setall_f32(ky2), sum0);
+            v_float32 sum0 = vx_load(&buf[r0][l]) * v_ky0;
+					  sum0 = v_fma(vx_load(&buf[r1][l]), v_ky1, sum0);
+					  sum0 = v_fma(vx_load(&buf[r2][l]), v_ky2, sum0);
 
-            v_float32 sum1 = vx_load(&buf[r0][l + nlanes/2]) * vx_setall_f32(ky0);
-                sum1 = v_fma(vx_load(&buf[r1][l + nlanes/2]),  vx_setall_f32(ky1), sum1);
-                sum1 = v_fma(vx_load(&buf[r2][l + nlanes/2]),  vx_setall_f32(ky2), sum1);
+            v_float32 sum1 = vx_load(&buf[r0][l + nlanes/2]) * v_ky0;
+					  sum1 = v_fma(vx_load(&buf[r1][l + nlanes/2]), v_ky1, sum1);
+					  sum1 = v_fma(vx_load(&buf[r2][l + nlanes/2]), v_ky2, sum1);
 
             if (!noscale)
             {
@@ -1123,27 +1190,28 @@ static void run_sepfilter3x3_any2short(DST out[], const SRC *in[], int width, in
             {
                 // signed short
                 v_int16 res = v_pack(isum0, isum1);
-                v_store(reinterpret_cast<short*>(&out[l]), res);
+                vx_store(reinterpret_cast<short*>(&out[l]), res);
             } else
             {
                 // unsigned short
                 v_uint16 res = v_pack_u(isum0, isum1);
-                v_store(reinterpret_cast<ushort*>(&out[l]), res);
+                vx_store(reinterpret_cast<ushort*>(&out[l]), res);
             }
         }
 
         // tail (if any)
         if (l < length)
         {
-            GAPI_DbgAssert(length >= nlanes);
-            l = length - nlanes;
+			l = length - nlanes;
+			continue;
         }
+		break;
     }
 }
 
 // this code with manually vectored rounding to uchar is 10-40x faster than reference
 template<bool noscale, typename SRC>
-static void run_sepfilter3x3_any2char(uchar out[], const SRC *in[], int width, int chan,
+CV_ALWAYS_INLINE void run_sepfilter3x3_any2char(uchar out[], const SRC *in[], int width, int chan,
                                       const float kx[], const float ky[], int border,
                                       float scale, float delta,
                                       float *buf[], int y, int y0)
@@ -1160,47 +1228,77 @@ static void run_sepfilter3x3_any2char(uchar out[], const SRC *in[], int width, i
     const float ky0 = ky[0], ky1 = ky[1], ky2 = ky[2];
 
     // horizontal pass
-
+	constexpr int nlanes = v_uint8::nlanes;
     int k0 = (y == y0)? 0: 2;
-
+	v_float32 v_kx0 = vx_setall_f32(kx0);
+	v_float32 v_kx1 = vx_setall_f32(kx1);
+	v_float32 v_kx2 = vx_setall_f32(kx2);
     for (int k = k0; k < 3; k++)
     {
         //                      previous , this , next pixel
         const SRC *s[3] = {in[k] - shift , in[k], in[k] + shift};
-
+#if 0
         // rely on compiler vectoring
         for (int l=0; l < length; l++)
         {
             buf[r[k]][l] = s[0][l]*kx0 + s[1][l]*kx1 + s[2][l]*kx2;
         }
+#else
+	for (int l = 0; length >= nlanes / 4;)
+	{
+		// main part of row
+		for (; l <= length - nlanes / 4; l += nlanes / 4)
+		{
+			v_float32 s0 = v_load_f32(&s[0][l]);
+			v_float32 s1 = v_load_f32(&s[1][l]);
+			v_float32 s2 = v_load_f32(&s[2][l]);
+
+			v_float32 res = s0 * v_kx0;
+			res = v_fma(s1, v_kx1, res);
+			res = v_fma(s2, v_kx2, res);
+			vx_store(&buf[r[k]][l], res);
+		}
+
+		// tail (if any)
+		if (l < length)
+		{
+			l = length - nlanes / 2;
+			continue;
+		}
+		break;
+	}
+#endif
     }
 
     // vertical pass
-
     const int r0=r[0], r1=r[1], r2=r[2];
 
-    for (int l=0; l < length;)
+	v_float32 v_ky0 = vx_setall_f32(ky0);
+	v_float32 v_ky1 = vx_setall_f32(ky1);
+	v_float32 v_ky2 = vx_setall_f32(ky2);
+
+    for (int l = 0; l < length;)
     {
-        constexpr int nlanes = v_uint8::nlanes;
+        
 
         // main part of row
         for (; l <= length - nlanes; l += nlanes)
         {
-            v_float32 sum0 = vx_load(&buf[r0][l])              * vx_setall_f32(ky0);
-                sum0 = v_fma(vx_load(&buf[r1][l]),               vx_setall_f32(ky1), sum0);
-                sum0 = v_fma(vx_load(&buf[r2][l]),               vx_setall_f32(ky2), sum0);
+            v_float32 sum0 = vx_load(&buf[r0][l])* v_ky0;
+					  sum0 = v_fma(vx_load(&buf[r1][l]), v_ky1, sum0);
+					  sum0 = v_fma(vx_load(&buf[r2][l]), v_ky2, sum0);
 
-            v_float32 sum1 = vx_load(&buf[r0][l +   nlanes/4]) * vx_setall_f32(ky0);
-                sum1 = v_fma(vx_load(&buf[r1][l +   nlanes/4]),  vx_setall_f32(ky1), sum1);
-                sum1 = v_fma(vx_load(&buf[r2][l +   nlanes/4]),  vx_setall_f32(ky2), sum1);
+            v_float32 sum1 = vx_load(&buf[r0][l + nlanes/4]) * v_ky0;
+					  sum1 = v_fma(vx_load(&buf[r1][l + nlanes/4]), v_ky1, sum1);
+					  sum1 = v_fma(vx_load(&buf[r2][l + nlanes/4]), v_ky2, sum1);
 
-            v_float32 sum2 = vx_load(&buf[r0][l + 2*nlanes/4]) * vx_setall_f32(ky0);
-                sum2 = v_fma(vx_load(&buf[r1][l + 2*nlanes/4]),  vx_setall_f32(ky1), sum2);
-                sum2 = v_fma(vx_load(&buf[r2][l + 2*nlanes/4]),  vx_setall_f32(ky2), sum2);
+            v_float32 sum2 = vx_load(&buf[r0][l + 2*nlanes/4]) * v_ky0;
+					  sum2 = v_fma(vx_load(&buf[r1][l + 2*nlanes/4]), v_ky1, sum2);
+					  sum2 = v_fma(vx_load(&buf[r2][l + 2*nlanes/4]), v_ky2, sum2);
 
-            v_float32 sum3 = vx_load(&buf[r0][l + 3*nlanes/4]) * vx_setall_f32(ky0);
-                sum3 = v_fma(vx_load(&buf[r1][l + 3*nlanes/4]),  vx_setall_f32(ky1), sum3);
-                sum3 = v_fma(vx_load(&buf[r2][l + 3*nlanes/4]),  vx_setall_f32(ky2), sum3);
+            v_float32 sum3 = vx_load(&buf[r0][l + 3*nlanes/4]) * v_ky0;
+					  sum3 = v_fma(vx_load(&buf[r1][l + 3*nlanes/4]), v_ky1, sum3);
+					  sum3 = v_fma(vx_load(&buf[r2][l + 3*nlanes/4]), v_ky2, sum3);
 
             if (!noscale)
             {
@@ -1219,7 +1317,7 @@ static void run_sepfilter3x3_any2char(uchar out[], const SRC *in[], int width, i
                     ires1 = v_pack(isum2, isum3);
 
             v_uint8 res = v_pack_u(ires0, ires1);
-            v_store(reinterpret_cast<uchar*>(&out[l]), res);
+            vx_store(reinterpret_cast<uchar*>(&out[l]), res);
         }
 
         // tail (if any)
@@ -1236,7 +1334,7 @@ static void run_sepfilter3x3_any2char(uchar out[], const SRC *in[], int width, i
 
 #if USE_SEPFILTER3X3_CHAR2SHORT
 template<bool noscale>
-static void run_sepfilter3x3_char2short(short out[], const uchar *in[], int width, int chan,
+CV_ALWAYS_INLINE void run_sepfilter3x3_char2short(short out[], const uchar *in[], int width, int chan,
                                         const float kx[], const float ky[], int border,
                                         float scale, float delta,
                                         float *buf[], int y, int y0)
@@ -1295,7 +1393,7 @@ static void run_sepfilter3x3_char2short(short out[], const uchar *in[], int widt
                 v_int16 t = v_reinterpret_as_s16(t0) * vx_setall_s16(ikx0) +
                             v_reinterpret_as_s16(t1) * vx_setall_s16(ikx1) +
                             v_reinterpret_as_s16(t2) * vx_setall_s16(ikx2);
-                v_store(&ibuf[r[k]][l], t);
+                vx_store(&ibuf[r[k]][l], t);
             }
 
             // tail (if any)

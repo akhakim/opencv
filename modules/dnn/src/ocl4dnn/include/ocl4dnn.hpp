@@ -269,13 +269,11 @@ class OCL4DNNConvSpatial
         void generate_idlf_tuneritems(std::vector< cv::Ptr<tunerParam> > &tunerItems,
                                       int blockM, int blockK, int simd_size);
         void setFusionDefine(ocl4dnnFusedActiv_t fused_activ, bool fused_eltwise);
-        void setFusionArg(ocl4dnnFusedActiv_t fused_activ, bool fused_eltwise, ocl::Kernel &kernel, cl_uint &argIdx);
+        void setFusionArg(ocl4dnnFusedActiv_t fused_activ, bool fused_eltwise, int fused_eltwise_offset, ocl::Kernel &kernel, cl_uint &argIdx);
 
         int32_t group_;
         bool bias_term_;
         UMat swizzled_weights_umat;
-        UMat weights_half;
-        UMat bias_half;
         UMat bottom_data2_;
 
         int32_t bottom_index_;

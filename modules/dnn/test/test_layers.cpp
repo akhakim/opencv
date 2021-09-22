@@ -169,8 +169,17 @@ TEST_P(Test_Caffe_layers, Softmax)
 
 TEST_P(Test_Caffe_layers, LRN)
 {
-    testLayerUsingCaffeModels("layer_lrn_spatial");
-    testLayerUsingCaffeModels("layer_lrn_channels");
+    double l1 = 0.0, lInf = 0.0;
+    // The OpenCL kernels use the native_ math functions which have
+    // implementation defined accuracy, so we use relaxed thresholds. See
+    // https://github.com/opencv/opencv/issues/9821 for more details.
+    if (target == DNN_TARGET_OPENCL)
+    {
+        l1 = 0.01;
+        lInf = 0.01;
+    }
+    testLayerUsingCaffeModels("layer_lrn_spatial", false, true, l1, lInf);
+    testLayerUsingCaffeModels("layer_lrn_channels", false, true, l1, lInf);
 }
 
 TEST_P(Test_Caffe_layers, Convolution)
@@ -436,7 +445,7 @@ class Layer_LSTM_Test : public ::testing::Test
 {
 public:
     int numInp, numOut;
-    Mat Wh, Wx, b;
+    Mat Wh, Wx, b, h, c;
     Ptr<LSTMLayer> layer;
     std::vector<Mat> inputs, outputs;
 
@@ -451,12 +460,17 @@ public:
         Wh = Mat::ones(4 * numOut, numOut, CV_32F);
         Wx = Mat::ones(4 * numOut, numInp, CV_32F);
         b  = Mat::ones(4 * numOut, 1, CV_32F);
+        h  = Mat::ones(4, numOut, CV_32F);
+        c  = Mat::ones(4, numOut, CV_32F);
 
         LayerParams lp;
-        lp.blobs.resize(3);
+        lp.blobs.resize(5);
         lp.blobs[0] = Wh;
         lp.blobs[1] = Wx;
         lp.blobs[2] = b;
+        lp.blobs[3] = h;
+        lp.blobs[4] = c;
+
         lp.set<bool>("produce_cell_output", produceCellOutput);
         lp.set<bool>("use_timestamp_dim", useTimestampDim);
 
@@ -504,10 +518,12 @@ TEST_F(Layer_LSTM_Test, get_set_test)
 TEST(Layer_LSTM_Test_Accuracy_with_, CaffeRecurrent)
 {
     LayerParams lp;
-    lp.blobs.resize(3);
+    lp.blobs.resize(5);
     lp.blobs[0] = blobFromNPY(_tf("lstm.prototxt.w_2.npy"));  // Wh
     lp.blobs[1] = blobFromNPY(_tf("lstm.prototxt.w_0.npy"));  // Wx
     lp.blobs[2] = blobFromNPY(_tf("lstm.prototxt.w_1.npy"));  // bias
+    lp.blobs[3] = Mat::zeros(2, 17, CV_32F);                     // h_0
+    lp.blobs[4] = Mat::zeros(2, 17, CV_32F);                     // c_0
     Ptr<LSTMLayer> layer = LSTMLayer::create(lp);
 
     Mat inp = blobFromNPY(_tf("recurrent.input.npy"));
@@ -515,6 +531,97 @@ TEST(Layer_LSTM_Test_Accuracy_with_, CaffeRecurrent)
     runLayer(layer, inputs, outputs);
 
     Mat h_t_reference = blobFromNPY(_tf("lstm.prototxt.h_1.npy"));
+    normAssert(h_t_reference, outputs[0]);
+}
+
+TEST(Layer_LSTM_Test_Accuracy_with_, HiddenParams)
+{
+    Mat Wx = blobFromNPY(_tf("lstm.hidden.W.npy"));
+    Mat Wh = blobFromNPY(_tf("lstm.hidden.R.npy"));
+    Mat b = blobFromNPY(_tf("lstm.hidden.B.npy"));
+    Mat h0 = blobFromNPY(_tf("lstm.hidden.h0.npy"));
+    Mat c0 = blobFromNPY(_tf("lstm.hidden.c0.npy"));
+
+    const int numHidden = 3;
+    const int numDirs = Wx.size[0];
+    const int numFeatures = Wx.size[2];
+
+    b = b.reshape(1, b.size[0]);
+    Mat bx = b.colRange(0, b.cols / 2);
+    Mat bh = b.colRange(b.cols / 2, b.cols);
+    b = bx + bh;
+
+    // IFGO->IGFO
+    for (int k = 0; k < numDirs; ++k)
+    {
+        float* WxData = Wx.ptr<float>(k);
+        float* WhData = Wh.ptr<float>(k);
+        float* biasData = b.ptr<float>(k);
+        for (int j = 0; j < numHidden; ++j)
+        {
+            for (int i = 0; i < numFeatures; ++i)
+            {
+                std::swap(WxData[(numHidden + j) * numFeatures + i],
+                          WxData[(numHidden * 2 + j) * numFeatures + i]);
+            }
+            for (int i = 0; i < numHidden; ++i)
+            {
+                std::swap(WhData[(numHidden + j) * numHidden + i],
+                          WhData[(numHidden * 2 + j) * numHidden + i]);
+            }
+            std::swap(biasData[numHidden + j], biasData[numHidden * 2 + j]);
+        }
+    }
+
+    Wx = Wx.reshape(1, Wx.size[0] * Wx.size[1]);
+    Wh = Wh.reshape(1, Wh.size[0] * Wh.size[1]);
+    h0 = h0.reshape(1, h0.size[0] * h0.size[1]);
+    c0 = c0.reshape(1, c0.size[0] * c0.size[1]);
+
+    LayerParams lstmParams;
+    lstmParams.blobs.resize(5);
+    lstmParams.blobs[0] = Wh;
+    lstmParams.blobs[1] = Wx;
+    lstmParams.blobs[2] = b;
+    lstmParams.blobs[3] = h0;
+    lstmParams.blobs[4] = c0;
+    lstmParams.set("bidirectional", false);
+    Ptr<LSTMLayer> layer = LSTMLayer::create(lstmParams);
+
+    Mat inp = blobFromNPY(_tf("lstm.hidden.input.npy"));
+    std::vector<Mat> inputs(1, inp), outputs;
+    runLayer(layer, inputs, outputs);
+
+    Mat h_t_reference = blobFromNPY(_tf("lstm.hidden.output.npy"));
+    normAssert(h_t_reference, outputs[0]);
+}
+
+TEST(Layer_GRU_Test_Accuracy_with_, Pytorch)
+{
+    Mat Wx = blobFromNPY(_tf("gru.W.npy"));
+    Mat Wh = blobFromNPY(_tf("gru.R.npy"));
+    Mat b = blobFromNPY(_tf("gru.B.npy"));
+    Mat h0 = blobFromNPY(_tf("gru.h0.npy"));
+
+    Wx = Wx.reshape(1, Wx.size[0] * Wx.size[1]);
+    Wh = Wh.reshape(1, Wh.size[0] * Wh.size[1]);
+    h0 = h0.reshape(1, h0.size[0] * h0.size[1]);
+    b = b.reshape(1, b.size[0]);
+
+    LayerParams gruParams;
+    gruParams.blobs.resize(4);
+    gruParams.blobs[0] = Wh;
+    gruParams.blobs[1] = Wx;
+    gruParams.blobs[2] = b;
+    gruParams.blobs[3] = h0;
+    gruParams.set("bidirectional", false);
+    Ptr<GRULayer> layer = GRULayer::create(gruParams);
+
+    Mat inp = blobFromNPY(_tf("gru.input.npy"));
+    std::vector<Mat> inputs(1, inp), outputs;
+    runLayer(layer, inputs, outputs);
+
+    Mat h_t_reference = blobFromNPY(_tf("gru.output.npy"));
     normAssert(h_t_reference, outputs[0]);
 }
 
@@ -562,6 +669,9 @@ TEST(Layer_LSTM_Test_Accuracy_, Reverse)
     bias.at<float>(2, 0) = 1e10f;  // Output gate - always output everything
     bias.at<float>(3, 0) = 0.f;  // Update signal
 
+    cv::Mat hInternal = cv::Mat::zeros(1, 1, CV_32FC1);
+    cv::Mat cInternal = cv::Mat::zeros(1, 1, CV_32FC1);
+
     LayerParams lp;
     lp.set("reverse", true);
     lp.set("use_timestamp_dim", true);
@@ -569,6 +679,8 @@ TEST(Layer_LSTM_Test_Accuracy_, Reverse)
     lp.blobs.push_back(Wh);
     lp.blobs.push_back(Wx);
     lp.blobs.push_back(bias);
+    lp.blobs.push_back(hInternal);
+    lp.blobs.push_back(cInternal);
 
     cv::Ptr<cv::dnn::LSTMLayer> layer = LSTMLayer::create(lp);
     std::vector<cv::Mat> outputs;
@@ -1583,6 +1695,11 @@ TEST_P(Test_Caffe_layers, Interp)
 TEST_P(Test_Caffe_layers, DISABLED_Interp)  // requires patched protobuf (available in OpenCV source tree only)
 #endif
 {
+#if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_EQ(2021030000)
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && target == DNN_TARGET_MYRIAD)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD, CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);  // exception
+#endif
+
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target == DNN_TARGET_MYRIAD)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD);
 
@@ -2152,6 +2269,12 @@ public:
             randu(scales, -1.0f, 1.0f);
             activationParams.blobs.push_back(scales);
         }
+        else if (activationParams.type == "Exp")
+        {
+            activationParams.set("base", -1.0f);
+            activationParams.set("scale", 0.3f);
+            activationParams.set("shift", 0.6f);
+        }
     }
 
     static void makeDefaultTestEltwiseLayer(LayerParams& eltwiseParams, const std::string& op, bool withCoefficients)
@@ -2223,12 +2346,12 @@ public:
     static testing::internal::ParamGenerator<std::string> activationLayersList()
     {
         // TODO: automate list generation
-        return Values("ReLU", "ReLU6", "ChannelsPReLU", "TanH", "Swish", "Mish", "Sigmoid", "ELU", "AbsVal", "BNLL", "Power");
+        return Values("ReLU", "ReLU6", "ChannelsPReLU", "TanH", "Swish", "Mish", "Sigmoid", "ELU", "AbsVal", "BNLL", "Power", "Exp");
     }
 
     static testing::internal::ParamGenerator<tuple<Backend, Target> > dnnBackendsAndTargetsForFusionTests()
     {
-        return dnnBackendsAndTargets(false, false, true, false, false, false); // OCV OpenCL + OCV CPU
+        return dnnBackendsAndTargets(false, false, true, false, true, false); // OCV OpenCL + OCV CPU + CUDA
     }
 };
 
@@ -2264,17 +2387,6 @@ TEST_P(ConvolutionActivationFusion, Accuracy)
     Backend backendId = get<0>(get<2>(GetParam()));
     Target targetId = get<1>(get<2>(GetParam()));
 
-    // bug: https://github.com/opencv/opencv/issues/17964
-    if (actType == "Power" && backendId == DNN_BACKEND_OPENCV && (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16))
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL);
-
-    // bug: https://github.com/opencv/opencv/issues/17953
-    if (actType == "ChannelsPReLU" && bias_term == false &&
-        backendId == DNN_BACKEND_OPENCV && (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16))
-    {
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL);
-    }
-
     Net net;
     int convId = net.addLayer(convParams.name, convParams.type, convParams);
     int activId = net.addLayerToPrev(activationParams.name, activationParams.type, activationParams);
@@ -2287,11 +2399,16 @@ TEST_P(ConvolutionActivationFusion, Accuracy)
             expectedFusedLayers.push_back(activId); // all activations are fused
         else if (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16)
         {
-            if (actType == "ReLU" || actType == "ChannelsPReLU" || actType == "ReLU6" || actType == "TanH" || actType == "Power")
+            if (actType == "ReLU" || actType == "ChannelsPReLU" || actType == "ReLU6" || actType == "TanH" /*|| actType == "Power"*/)
                 expectedFusedLayers.push_back(activId);
         }
     }
-
+    else if (backendId == DNN_BACKEND_CUDA)
+    {
+        if (actType == "ReLU" || actType == "ReLU6" || actType == "TanH" || actType == "Swish" ||
+            actType == "Mish" || actType == "Sigmoid" || actType == "Power")
+                expectedFusedLayers.push_back(activId);
+    }
     TestLayerFusion::test(input, net, backendId, targetId, expectedFusedLayers);
 }
 INSTANTIATE_TEST_CASE_P(TestLayerFusion, ConvolutionActivationFusion, Combine(
@@ -2330,7 +2447,7 @@ TEST_P(ConvolutionEltwiseFusion, Accuracy)
     std::string eltwiseOp = get<1>(GetParam());
     bool weightedEltwise = get<2>(GetParam());
     if (eltwiseOp != "sum" && weightedEltwise)
-            throw SkipTestException("weighted eltwise not supported");
+        throw SkipTestException("weighted eltwise not supported");
     LayerParams eltwiseParams;
     TestLayerFusion::makeDefaultTestEltwiseLayer(eltwiseParams, eltwiseOp, weightedEltwise);
 
@@ -2343,7 +2460,11 @@ TEST_P(ConvolutionEltwiseFusion, Accuracy)
 
     Backend backendId = get<0>(get<3>(GetParam()));
     Target targetId = get<1>(get<3>(GetParam()));
-    TestLayerFusion::test(input, net, backendId, targetId);
+
+    std::vector<int> expectedFusedLayers;
+    if (backendId == DNN_BACKEND_CUDA && eltwiseOp == "sum" && !weightedEltwise)
+        expectedFusedLayers.push_back(eltwiseId);
+    TestLayerFusion::test(input, net, backendId, targetId, expectedFusedLayers);
 }
 INSTANTIATE_TEST_CASE_P(TestLayerFusion, ConvolutionEltwiseFusion, Combine(
 /* bias */              testing::Bool(),
@@ -2397,21 +2518,6 @@ TEST_P(ConvolutionEltwiseActivationFusion, Accuracy)
     Backend backendId = get<0>(get<4>(GetParam()));
     Target targetId = get<1>(get<4>(GetParam()));
 
-    // bug: https://github.com/opencv/opencv/issues/17945
-    if ((eltwiseOp != "sum" || weightedEltwise) && backendId == DNN_BACKEND_OPENCV && (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16))
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL);
-
-    // bug: https://github.com/opencv/opencv/issues/17953
-    if (eltwiseOp == "sum" && actType == "ChannelsPReLU" && bias_term == false &&
-        backendId == DNN_BACKEND_OPENCV && (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16))
-    {
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL);
-    }
-
-    // bug: https://github.com/opencv/opencv/issues/17964
-    if (actType == "Power" && backendId == DNN_BACKEND_OPENCV && (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16))
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL);
-
     Net net;
     int convId = net.addLayer(convParams.name, convParams.type, convParams);
     int eltwiseId = net.addLayer(eltwiseParams.name, eltwiseParams.type, eltwiseParams);
@@ -2428,14 +2534,25 @@ TEST_P(ConvolutionEltwiseActivationFusion, Accuracy)
             expectedFusedLayers.push_back(activId); // activation is fused with eltwise layer
         else if (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16)
         {
-            if (actType == "ReLU" || actType == "ChannelsPReLU" || actType == "Power")
+            if (eltwiseOp == "sum" && !weightedEltwise &&
+                (actType == "ReLU" || actType == "ChannelsPReLU" /*|| actType == "Power"*/)
+            )
             {
                 expectedFusedLayers.push_back(eltwiseId);
                 expectedFusedLayers.push_back(activId);
             }
         }
     }
-
+    else if(backendId == DNN_BACKEND_CUDA)
+    {
+        if (eltwiseOp == "sum" && !weightedEltwise)
+        {
+            expectedFusedLayers.push_back(eltwiseId);
+            if (actType == "ReLU" || actType == "ReLU6" || actType == "TanH" || actType == "Swish" ||
+                actType == "Mish" || actType == "Sigmoid" || actType == "Power")
+                expectedFusedLayers.push_back(activId);
+        }
+    }
     TestLayerFusion::test(input, net, backendId, targetId, expectedFusedLayers);
 }
 INSTANTIATE_TEST_CASE_P(TestLayerFusion, ConvolutionEltwiseActivationFusion, Combine(
@@ -2490,17 +2607,6 @@ TEST_P(ConvolutionActivationEltwiseFusion, Accuracy)
     Backend backendId = get<0>(get<4>(GetParam()));
     Target targetId = get<1>(get<4>(GetParam()));
 
-    // bug: https://github.com/opencv/opencv/issues/17964
-    if (actType == "Power" && backendId == DNN_BACKEND_OPENCV && (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16))
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL);
-
-    // bug: https://github.com/opencv/opencv/issues/17953
-    if (actType == "ChannelsPReLU" && bias_term == false &&
-        backendId == DNN_BACKEND_OPENCV && (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16))
-    {
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL);
-    }
-
     Net net;
     int convId = net.addLayer(convParams.name, convParams.type, convParams);
     int activId = net.addLayer(activationParams.name, activationParams.type, activationParams);
@@ -2517,11 +2623,20 @@ TEST_P(ConvolutionActivationEltwiseFusion, Accuracy)
             expectedFusedLayers.push_back(activId); // activation fused with convolution
         else if (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16)
         {
-            if (actType == "ReLU" || actType == "ChannelsPReLU" || actType == "ReLU6" || actType == "TanH" || actType == "Power")
+            if (actType == "ReLU" || actType == "ChannelsPReLU" || actType == "ReLU6" || actType == "TanH" /*|| actType == "Power"*/)
                 expectedFusedLayers.push_back(activId); // activation fused with convolution
         }
     }
-
+    else if(backendId == DNN_BACKEND_CUDA)
+    {
+        if (actType == "ReLU" || actType == "ReLU6" || actType == "TanH" || actType == "Swish" ||
+            actType == "Mish" || actType == "Sigmoid" || actType == "Power")
+        {
+                expectedFusedLayers.push_back(activId);
+                if (eltwiseOp == "sum" && !weightedEltwise)
+                    expectedFusedLayers.push_back(eltwiseId);
+        }
+    }
     TestLayerFusion::test(input, net, backendId, targetId, expectedFusedLayers);
 }
 INSTANTIATE_TEST_CASE_P(TestLayerFusion, ConvolutionActivationEltwiseFusion, Combine(

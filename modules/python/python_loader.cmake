@@ -28,7 +28,8 @@ set(PYTHON_LOADER_FILES
 )
 foreach(fname ${PYTHON_LOADER_FILES})
   get_filename_component(__dir "${fname}" DIRECTORY)
-  file(COPY "${PYTHON_SOURCE_DIR}/package/${fname}" DESTINATION "${__loader_path}/${__dir}")
+  # avoid using of file(COPY) to rerun CMake on changes
+  configure_file("${PYTHON_SOURCE_DIR}/package/${fname}" "${__loader_path}/${fname}" COPYONLY)
   if(fname STREQUAL "setup.py")
     if(OPENCV_PYTHON_SETUP_PY_INSTALL_PATH)
       install(FILES "${PYTHON_SOURCE_DIR}/package/${fname}" DESTINATION "${OPENCV_PYTHON_SETUP_PY_INSTALL_PATH}" COMPONENT python)

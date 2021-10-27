@@ -351,23 +351,30 @@ PERF_TEST_P_(DivPerfTest, TestPerformance)
     if (true) {
 #if 1
         for (int i = 0; i < out_mat_gapi.size().height; i++) {
-            for (int j = 0; j < out_mat_gapi.size().width; j++) {
-                if ((out_mat_gapi.at<int16_t>(i, j) != out_mat_ocv.at<int16_t>(i, j)) &&
-                    (cv::abs(out_mat_gapi.at<int16_t>(i, j) - out_mat_ocv.at<int16_t>(i, j)) > 1))
+            for (int j = 0; j < out_mat_gapi.size().width* out_mat_gapi.channels(); j++) {
+#if 0
+                if (i == 2)
+                    std::cout << " col = " << j << " row = " << i << " G-API: " << (float)out_mat_gapi.at<float>(i, j)
+                    << " OCV: " << (float)out_mat_ocv.at<float>(i, j) << " diff = " << (float)cv::abs(out_mat_gapi.at<float>(i, j) - out_mat_ocv.at<float>(i, j))
+                    << std::endl << std::endl;
+#endif
+                if ((out_mat_gapi.at<uint16_t>(i, j) != out_mat_ocv.at<uint16_t>(i, j)) && (cv::abs(out_mat_gapi.at<uint16_t>(i, j) - out_mat_ocv.at<uint16_t>(i, j)) > 0))
                 {
+                    std::cout << "error number = " << error << std::endl << std::endl;
+                    std::cout << " col = " << j << " row = " << i << " G-API: " << (int)out_mat_gapi.at<uint16_t>(i, j)
+                              << " OCV: " << (int)out_mat_ocv.at<uint16_t>(i, j) << " diff = " << (int)cv::abs(out_mat_gapi.at<uint16_t>(i, j) - out_mat_ocv.at<uint16_t>(i, j))
+                              << std::endl << std::endl;
                     error++;
-                    std::cout << " col = " << j << " row = " << i << " G-API: " << (int)out_mat_gapi.at<int16_t>(i, j) << " OCV: " << (int)out_mat_ocv.at<int16_t>(i, j) << " diff = " << (int)cv::abs(out_mat_gapi.at<int16_t>(i, j) - out_mat_ocv.at<int16_t>(i, j)) << std::endl << std::endl;
-                    std::cout << "error number = " << error << std::endl;
                 }
             }
         }
 #endif
-       // std::cout << "=========================================== G-API ======================================" << std::endl<< std::endl;
+        std::cout << "=========================================== G-API ======================================" << std::endl<< std::endl;
 
         //std::cout << (int)out_mat_gapi.at<uint8_t>(0, 1) << std::endl << std::endl;
 
         //std::cout << out_mat_gapi /*cv::format(out_mat_gapi, cv::Formatter::FMT_C)*/ << std::endl << std::endl;
-        //std::cout << "=========================================== OCV =======================================" << std::endl << std::endl;
+        std::cout << "=========================================== OCV =======================================" << std::endl << std::endl;
         //std::cout << out_mat_ocv /*cv::format(out_mat_ocv, cv::Formatter::FMT_PYTHON)*/ << std::endl << std::endl;
     }
     //counter++;

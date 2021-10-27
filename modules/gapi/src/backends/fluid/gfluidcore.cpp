@@ -22,7 +22,7 @@
 #include "gfluidbuffer_priv.hpp"
 #include "gfluidbackend.hpp"
 #include "gfluidutils.hpp"
-
+//#include <opencv2/core.hpp>
 #include <math.h>
 
 #include <cassert>
@@ -42,7 +42,7 @@ template<typename DST, typename SRC1, typename SRC2>
 static inline DST absdiff(SRC1 x, SRC2 y)
 {
     auto result = x > y? x - y: y - x;
-    return saturate<DST>(result, roundf);
+    return saturate<DST>(result, roundf);    
 }
 
 template<typename DST, typename SRC1, typename SRC2>
@@ -646,17 +646,28 @@ struct vector_type_of;
 template<typename scalar_t>
 using vector_type_of_t = typename vector_type_of<scalar_t>::type;
 
-template<> struct vector_type_of<uchar> { using type = v_uint8; };
+template<> struct vector_type_of<uchar> { using type = v_uint16; };
 template<> struct vector_type_of<ushort> { using type = v_uint16; };
 template<> struct vector_type_of<short> { using type = v_int16; };
-CV_ALWAYS_INLINE v_int16 v_load_div_f32(const short* src, const v_int16& zero, v_float32& div1, v_float32& div2)
+template<typename SRC>
+CV_ALWAYS_INLINE v_uint16 v_load_div_f32(const SRC* src, const v_uint16& zero, v_float32& div1, v_float32& div2)
+{
+    v_uint16 div = v_reinterpret_as_u16(vx_load(src));
+    v_uint32 d1, d2;
+    v_expand(div, d1, d2);
+    div1 = v_cvt_f32(v_reinterpret_as_s32(d1));
+    div2 = v_cvt_f32(v_reinterpret_as_s32(d2));
+    return (div == zero);
+}
+#if 0
+CV_ALWAYS_INLINE v_uint16 v_load_div_f32(const short* src, const v_int16& zero, v_float32& div1, v_float32& div2)
 {
     v_int16 div = vx_load(src);
     v_int32 d1, d2;
     v_expand(div, d1, d2);
     div1 = v_cvt_f32(d1);
     div2 = v_cvt_f32(d2);
-    return (div == zero);
+    return v_reinterpret_as_u16(div == zero);
 }
 
 CV_ALWAYS_INLINE v_uint16 v_load_div_f32(const ushort* src, const v_uint16& zero, v_float32& div1, v_float32& div2)
@@ -668,7 +679,7 @@ CV_ALWAYS_INLINE v_uint16 v_load_div_f32(const ushort* src, const v_uint16& zero
     div2 = v_cvt_f32(v_reinterpret_as_s32(d2));
     return (div == zero);
 }
-
+#endif
 CV_ALWAYS_INLINE v_uint16 v_load_div_f32(const uchar* src, const v_uint16& zero, v_float32& div1, v_float32& div2)
 {
     v_uint16 div = vx_load_expand(src);
@@ -696,9 +707,9 @@ CV_ALWAYS_INLINE v_int16 v_load_div_f32(const float* src, const v_int16& zero, v
     return zero;
 }
 
-CV_ALWAYS_INLINE void v_store_div_i16(short* dst, const v_int16& mask, const v_int16& zero, v_int32& res1, v_int32& res2)
+CV_ALWAYS_INLINE void v_store_div_i16(short* dst, const v_uint16& mask, const v_uint16& zero, v_int32& res1, v_int32& res2)
 {
-    vx_store(dst, v_select(mask, zero, v_pack(res1, res2)));
+    vx_store(dst, v_reinterpret_as_s16(v_select(mask, zero, v_pack_u(res1, res2))));
 }
 
 CV_ALWAYS_INLINE void v_store_div_i16(ushort* dst, const v_uint16& mask, const v_uint16& zero, v_int32& res1, v_int32& res2)
@@ -707,24 +718,18 @@ CV_ALWAYS_INLINE void v_store_div_i16(ushort* dst, const v_uint16& mask, const v
 }
 
 
-
-template<typename SRC, typename DST>
-CV_ALWAYS_INLINE int div_hal(const SRC in1[], const SRC in2[], DST out[],
+CV_ALWAYS_INLINE int div_hal(const short in1[], const short in2[], ushort out[],
                              int length, double _scale)
 {
-    static_assert(/*((std::is_same<SRC, ushort>::value) || (std::is_same<SRC, short>::value)) &&*/
-                  ((std::is_same<DST, ushort>::value) || (std::is_same<DST, short>::value)),
-                  "This templated overload is only for short and ushort type combinations.");
-
-    constexpr int nlanes = vector_type_of_t<DST>::nlanes;
+    constexpr int nlanes = v_uint16::nlanes;
 
     if (length < nlanes)
         return 0;
 
-    const vector_type_of_t<DST> v_zero = vx_setall<vector_type_of_t<DST>::lane_type>(0);
-    
+    v_uint16 v_zero = vx_setall_u16(0);//vx_setall<typename vector_type_of_t<DST>::lane_type>(0);
     v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
-    v_float32 div1, div2;
+
+    v_int32 div1, div2;
     int x = 0;
     for (;;)
     {
@@ -732,12 +737,21 @@ CV_ALWAYS_INLINE int div_hal(const SRC in1[], const SRC in2[], DST out[],
         {
             v_float32 a1 = v_load_f32(&in1[x]);
             v_float32 a2 = v_load_f32(&in1[x + nlanes / 2]);
-            const vector_type_of_t<DST> mask = v_load_div_f32(&in2[x], v_zero, div1, div2);
+
+            v_int16 div = vx_load(&in2[x]);
+            v_expand(div, div1, div2);
+            v_float32 fdiv1 = v_cvt_f32(div1);
+            v_float32 fdiv2 = v_cvt_f32(div2);
+
+            v_int32 r1 = v_round(a1 * (scale / fdiv1));
+            v_int32 r2 = v_round(a2 * (scale / fdiv2));
+
+            vx_store(&out[x], v_select(v_reinterpret_as_u16(div) == v_zero, v_zero, v_pack_u(r1, r2)));
             //v_float32 b1 = v_load_f32(&in2[x]);
             //v_float32 b2 = v_load_f32(&in2[x + nlanes / 2]);
             //v_select(denom == v_zero, v_zero, res);
-            v_store_i16(&out[x], v_round(a1 * (scale / div1)),
-                                 v_round(a2 * (scale / div2)));
+            //v_store_div_i16(&out[x], mask, v_zero, v_round(a1 * (scale / div1)),
+            //                                       v_round(a2 * (scale / div2)));
         }
 
         if (x < length)
@@ -750,8 +764,48 @@ CV_ALWAYS_INLINE int div_hal(const SRC in1[], const SRC in2[], DST out[],
     return x;
 }
 
-template<typename SRC>
-CV_ALWAYS_INLINE int div_hal(const SRC in1[], const SRC in2[], uchar out[],
+CV_ALWAYS_INLINE int div_hal(const ushort in1[], const ushort in2[], short out[],
+                             int length, double _scale)
+{
+    constexpr int nlanes = v_uint16::nlanes;
+
+    if (length < nlanes)
+        return 0;
+
+    v_int16 v_zero = vx_setall_s16(0);
+    v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
+
+    v_uint32 div1, div2;
+    int x = 0;
+    for (;;)
+    {
+        for (; x <= length - nlanes; x += nlanes)
+        {
+            v_float32 a1 = v_load_f32(&in1[x]);
+            v_float32 a2 = v_load_f32(&in1[x + nlanes / 2]);
+
+            v_uint16 div = vx_load(&in2[x]);
+            v_expand(div, div1, div2);
+            v_float32 fdiv1 = v_cvt_f32(v_reinterpret_as_s32(div1));
+            v_float32 fdiv2 = v_cvt_f32(v_reinterpret_as_s32(div2));
+
+            v_int32 r1 = v_round(a1 * (scale / fdiv1));
+            v_int32 r2 = v_round(a2 * (scale / fdiv2));
+
+            vx_store(&out[x], v_select(v_reinterpret_as_s16(div) == v_zero, v_zero, v_pack(r1, r2)));
+        }
+
+        if (x < length)
+        {
+            x = length - nlanes;
+            continue;  // process one more time (unaligned tail)
+        }
+        break;
+    }
+    return x;
+}
+
+CV_ALWAYS_INLINE int div_hal(const ushort in1[], const ushort in2[], uchar out[],
                              int length, double _scale)
 {
     constexpr int nlanes = v_uint8::nlanes;
@@ -760,7 +814,8 @@ CV_ALWAYS_INLINE int div_hal(const SRC in1[], const SRC in2[], uchar out[],
         return 0;
 
     v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
-
+    v_uint16 v_zero = vx_setall_u16(0);
+    v_uint32 d1, d2, d3, d4;
     int x = 0;
     for (;;)
     {
@@ -770,17 +825,320 @@ CV_ALWAYS_INLINE int div_hal(const SRC in1[], const SRC in2[], uchar out[],
             v_float32 a2 = v_load_f32(&in1[x + nlanes / 4]);
             v_float32 a3 = v_load_f32(&in1[x + nlanes / 2]);
             v_float32 a4 = v_load_f32(&in1[x + 3 * nlanes / 4]);
-            v_float32 b1 = v_load_f32(&in2[x]);
-            v_float32 b2 = v_load_f32(&in2[x + nlanes / 4]);
-            v_float32 b3 = v_load_f32(&in2[x + nlanes / 2]);
-            v_float32 b4 = v_load_f32(&in2[x + 3 * nlanes / 4]);
 
-            v_int32 sum1 = v_round(a1 * scale / b1),
-                    sum2 = v_round(a2 * scale / b2),
-                    sum3 = v_round(a3 * scale / b3),
-                    sum4 = v_round(a4 * scale / b4);
+            v_uint16 div1 = vx_load(&in2[x]);
+            v_uint16 div2 = vx_load(&in2[x + nlanes/2]);
 
-            vx_store(&out[x], v_pack_u(v_pack(sum1, sum2), v_pack(sum3, sum4)));
+            v_expand(div1, d1, d2);
+            v_expand(div2, d3, d4);
+
+            v_float32 fdiv1 = v_cvt_f32(v_reinterpret_as_s32(d1));
+            v_float32 fdiv2 = v_cvt_f32(v_reinterpret_as_s32(d2));
+            v_float32 fdiv3 = v_cvt_f32(v_reinterpret_as_s32(d3));
+            v_float32 fdiv4 = v_cvt_f32(v_reinterpret_as_s32(d4));
+
+            v_int32 sum1 = v_round(a1 * scale / fdiv1),
+                    sum2 = v_round(a2 * scale / fdiv2),
+                    sum3 = v_round(a3 * scale / fdiv3),
+                    sum4 = v_round(a4 * scale / fdiv4);
+
+            v_uint16 r1 = v_pack_u(sum1, sum2);
+            v_uint16 r2 = v_pack_u(sum3, sum4);
+
+            v_uint16 mask1 = (div1 == v_zero);
+            v_uint16 mask2 = (div2 == v_zero);
+            v_uint16 res1 = v_select(mask1, v_zero, r1);
+            v_uint16 res2 = v_select(mask2, v_zero, r2);
+
+            vx_store(&out[x], v_pack(res1, res2));
+        }
+
+        if (x < length)
+        {
+            x = length - nlanes;
+            continue;  // process one more time (unaligned tail)
+        }
+        break;
+    }
+    return x;
+}
+
+CV_ALWAYS_INLINE int div_hal(const short in1[], const short in2[], uchar out[],
+                             int length, double _scale)
+{
+    constexpr int nlanes = v_uint8::nlanes;
+
+    if (length < nlanes)
+        return 0;
+
+    v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
+    v_int16 v_zero = vx_setall_s16(0);
+    v_int32 d1, d2, d3, d4;
+    int x = 0;
+    for (;;)
+    {
+        for (; x <= length - nlanes; x += nlanes)
+        {
+            v_float32 a1 = v_load_f32(&in1[x]);
+            v_float32 a2 = v_load_f32(&in1[x + nlanes / 4]);
+            v_float32 a3 = v_load_f32(&in1[x + nlanes / 2]);
+            v_float32 a4 = v_load_f32(&in1[x + 3 * nlanes / 4]);
+
+            v_int16 div1 = vx_load(&in2[x]);
+            v_int16 div2 = vx_load(&in2[x + nlanes/2]);
+
+            v_expand(div1, d1, d2);
+            v_expand(div2, d3, d4);
+
+            v_float32 fdiv1 = v_cvt_f32(v_reinterpret_as_s32(d1));
+            v_float32 fdiv2 = v_cvt_f32(v_reinterpret_as_s32(d2));
+            v_float32 fdiv3 = v_cvt_f32(v_reinterpret_as_s32(d3));
+            v_float32 fdiv4 = v_cvt_f32(v_reinterpret_as_s32(d4));
+
+            v_int32 sum1 = v_round(a1 * scale / fdiv1),
+                    sum2 = v_round(a2 * scale / fdiv2),
+                    sum3 = v_round(a3 * scale / fdiv3),
+                    sum4 = v_round(a4 * scale / fdiv4);
+
+            v_int16 r1 = v_pack(sum1, sum2);
+            v_int16 r2 = v_pack(sum3, sum4);
+           
+            v_int16 res1 = v_select((div1 == v_zero), v_zero, r1);
+            v_int16 res2 = v_select((div2 == v_zero), v_zero, r2);
+
+            vx_store(&out[x], v_pack_u(res1, res2));
+        }
+
+        if (x < length)
+        {
+            x = length - nlanes;
+            continue;  // process one more time (unaligned tail)
+        }
+        break;
+    }
+    return x;
+}
+
+CV_ALWAYS_INLINE int div_hal(const float in1[], const float in2[], uchar out[],
+                             int length, double _scale)
+{
+    constexpr int nlanes = v_uint8::nlanes;
+
+    if (length < nlanes)
+        return 0;
+
+    v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
+    v_float32 v_zero = vx_setall_f32(0);
+    int x = 0;
+    for (;;)
+    {
+        for (; x <= length - nlanes; x += nlanes)
+        {
+            v_float32 a1 = v_load_f32(&in1[x]);
+            v_float32 a2 = v_load_f32(&in1[x + nlanes / 4]);
+            v_float32 a3 = v_load_f32(&in1[x + nlanes / 2]);
+            v_float32 a4 = v_load_f32(&in1[x + 3 * nlanes / 4]);
+
+            v_float32 div1 = v_load_f32(&in2[x]);
+            v_float32 div2 = v_load_f32(&in2[x + nlanes / 4]);
+            v_float32 div3 = v_load_f32(&in2[x + nlanes / 2]);
+            v_float32 div4 = v_load_f32(&in2[x + 3 * nlanes / 4]);
+
+            v_float32 mask1 = (div1 == v_zero);
+            v_float32 mask2 = (div2 == v_zero);
+            v_float32 mask3 = (div3 == v_zero);
+            v_float32 mask4 = (div4 == v_zero);
+           
+            v_float32 r1 = a1 * (scale / div1);
+            v_float32 r2 = a2 * (scale / div2);
+            v_float32 r3 = a3 * (scale / div3);
+            v_float32 r4 = a4 * (scale / div4);
+
+            v_float32 sel1 = v_select(mask1, v_zero, r1);
+            v_float32 sel2 = v_select(mask2, v_zero, r2);
+            v_float32 sel3 = v_select(mask3, v_zero, r3);
+            v_float32 sel4 = v_select(mask4, v_zero, r4);
+
+            v_int32 res1 = v_round(sel1);
+            v_int32 res2 = v_round(sel2);
+            v_int32 res3 = v_round(sel3);
+            v_int32 res4 = v_round(sel4);
+
+            vx_store(&out[x], v_pack_u(v_pack(res1, res2), v_pack(res3, res4)));
+        }
+
+        if (x < length)
+        {
+            x = length - nlanes;
+            continue;  // process one more time (unaligned tail)
+        }
+        break;
+    }
+    return x;
+}
+
+CV_ALWAYS_INLINE int div_hal(const uchar in1[], const uchar in2[], short out[],
+                             int length, double _scale)
+{
+    constexpr int nlanes = v_int16::nlanes;
+
+    if (length < nlanes)
+        return 0;
+
+    v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
+    v_int16 v_zero = vx_setall_s16(0);
+    v_int32 d1, d2;
+    int x = 0;
+    for (;;)
+    {
+        for (; x <= length - nlanes; x += nlanes)
+        {
+            v_float32 a1 = v_load_f32(&in1[x]);
+            v_float32 a2 = v_load_f32(&in1[x + nlanes / 2]);
+
+            v_int16 div = v_reinterpret_as_s16(vx_load_expand(&in2[x]));
+
+            v_expand(div, d1, d2);
+            v_float32 fdiv1 = v_cvt_f32(v_reinterpret_as_s32(d1));
+            v_float32 fdiv2 = v_cvt_f32(v_reinterpret_as_s32(d2));
+
+            v_int32 r1 = v_round(a1 * (scale / fdiv1));
+            v_int32 r2 = v_round(a2 * (scale / fdiv2));
+
+            vx_store(&out[x], v_select(div == v_zero, v_zero, v_pack(r1, r2)));
+        }
+        if (x < length)
+        {
+            x = length - nlanes;
+            continue;  // process one more time (unaligned tail)
+        }
+        break;
+    }
+    return x;
+}
+
+CV_ALWAYS_INLINE int div_hal(const uchar in1[], const uchar in2[], ushort out[],
+                             int length, double _scale)
+{
+    constexpr int nlanes = v_int16::nlanes;
+
+    if (length < nlanes)
+        return 0;
+
+    v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
+    v_uint16 v_zero = vx_setall_u16(0);
+    v_uint32 d1, d2;
+    int x = 0;
+    for (;;)
+    {
+        for (; x <= length - nlanes; x += nlanes)
+        {
+            v_float32 a1 = v_load_f32(&in1[x]);
+            v_float32 a2 = v_load_f32(&in1[x + nlanes / 2]);
+
+            v_uint16 div = vx_load_expand(&in2[x]);
+
+            v_expand(div, d1, d2);
+
+            v_float32 fdiv1 = v_cvt_f32(v_reinterpret_as_s32(d1));
+            v_float32 fdiv2 = v_cvt_f32(v_reinterpret_as_s32(d2));
+
+            v_int32 r1 = v_round(a1 * (scale / fdiv1));
+            v_int32 r2 = v_round(a2 * (scale / fdiv2));
+
+            vx_store(&out[x], v_select(div == v_zero, v_zero, v_pack_u(r1, r2)));
+        }
+
+        if (x < length)
+        {
+            x = length - nlanes;
+            continue;  // process one more time (unaligned tail)
+        }
+        break;
+    }
+    return x;
+}
+
+CV_ALWAYS_INLINE int div_hal(const float in1[], const float in2[], ushort out[],
+                             int length, double _scale)
+{
+    constexpr int nlanes = v_uint16::nlanes;
+
+    if (length < nlanes)
+        return 0;
+
+    v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
+    v_float32 v_zero = vx_setall_f32(0);
+    int x = 0;
+    for (;;)
+    {
+        for (; x <= length - nlanes; x += nlanes)
+        {
+            v_float32 a1 = v_load_f32(&in1[x]);
+            v_float32 a2 = v_load_f32(&in1[x + nlanes / 2]);
+       
+            v_float32 fdiv1 = v_load_f32(&in2[x]);
+            v_float32 fdiv2 = v_load_f32(&in2[x + nlanes / 2]);
+
+            v_float32 mask1 = (fdiv1 == v_zero);
+            v_float32 mask2 = (fdiv2 == v_zero);
+
+            v_float32 r1 = a1 * (scale / fdiv1);
+            v_float32 r2 = a2 * (scale / fdiv2);
+                        
+            v_float32 sel1 = v_select(mask1, v_zero, r1);
+            v_float32 sel2 = v_select(mask2, v_zero, r2);
+
+            v_int32 res1 = v_round(sel1);
+            v_int32 res2 = v_round(sel2);
+
+            vx_store(&out[x], v_pack_u(res1, res2));
+        }
+
+        if (x < length)
+        {
+            x = length - nlanes;
+            continue;  // process one more time (unaligned tail)
+        }
+        break;
+    }
+    return x;
+}
+
+CV_ALWAYS_INLINE int div_hal(const float in1[], const float in2[], short out[],
+                             int length, double _scale)
+{
+    constexpr int nlanes = v_int16::nlanes;
+
+    if (length < nlanes)
+        return 0;
+
+    v_float32 scale = vx_setall_f32(static_cast<float>(_scale));
+    v_float32 v_zero = vx_setall_f32(0);
+    int x = 0;
+    for (;;)
+    {
+        for (; x <= length - nlanes; x += nlanes)
+        {
+            v_float32 a1 = v_load_f32(&in1[x]);
+            v_float32 a2 = v_load_f32(&in1[x + nlanes / 2]);
+       
+            v_float32 fdiv1 = v_load_f32(&in2[x]);
+            v_float32 fdiv2 = v_load_f32(&in1[x + nlanes / 2]);
+
+            v_float32 mask1 = (fdiv1 == v_zero);
+            v_float32 mask2 = (fdiv2 == v_zero);
+
+            v_float32 r1 = a1 * (scale / fdiv1);
+            v_float32 r2 = a2 * (scale / fdiv2);
+                        
+            v_float32 sel1 = v_select(mask1, v_zero, r1);
+            v_float32 sel2 = v_select(mask2, v_zero, r2);
+
+            v_int32 res1 = v_round(sel1);
+            v_int32 res2 = v_round(sel2);
+
+            vx_store(&out[x], v_pack(res1, res2));
         }
 
         if (x < length)
@@ -825,7 +1183,7 @@ CV_ALWAYS_INLINE int div_hal(const SRC in1[], const SRC in2[], float out[],
     return x;
 }
 #endif // CV_SIMD
-#if 0
+#if 1
 static void div_hal(const uchar in1[], const uchar in2[], uchar out[],
                     int length, double scale)
 {
